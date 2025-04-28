@@ -1,9 +1,8 @@
 # Copyright (c) 2023, Tri Dao.
 
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple, Union
 
 import torch
-import torch.nn as nn
 import os
 
 # isort: off
@@ -78,11 +77,12 @@ else:
     _torch_register_fake_wrapper = noop_register_fake_wrapper
 
 
-@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=(), device_types="cuda")
+@_torch_custom_op_wrapper("flash_attn::_flash_attn_forward", mutates_args=("out",), device_types="cuda")
 def _flash_attn_forward(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
+    out: torch.Tensor,
     dropout_p: float,
     softmax_scale: float,
     causal: bool,
@@ -90,14 +90,14 @@ def _flash_attn_forward(
     window_size_right: int,
     softcap: float,
     alibi_slopes: Optional[torch.Tensor],
-    return_softmax: bool
-) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    return_softmax: bool,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     out, softmax_lse, S_dmask, rng_state = flash_attn_gpu.fwd(
         q,
         k,
         v,
-        None,
+        out,
         alibi_slopes,
         dropout_p,
         softmax_scale,
@@ -108,7 +108,7 @@ def _flash_attn_forward(
         return_softmax,
         None,
     )
-    return out, softmax_lse, S_dmask, rng_state
+    return softmax_lse, S_dmask, rng_state
 
 
 @_torch_register_fake_wrapper("flash_attn::_flash_attn_forward")
@@ -128,20 +128,13 @@ def _flash_attn_forward_fake(
     q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
     batch_size, seqlen_q, num_heads, head_size = q.shape
     seqlen_k = k.shape[1]
-    out = torch.empty_like(q)
     softmax_lse = torch.empty((batch_size, num_heads, seqlen_q), dtype=torch.float32, device=q.device, layout=q.layout)
     p = torch.empty((0,), dtype=q.dtype, device=q.device, layout=q.layout)
     if return_softmax:
         p = torch.empty((batch_size, num_heads, round_multiple(seqlen_q, 128), round_multiple(seqlen_k, 128)), dtype=q.dtype, device=q.device, layout=q.layout)
     rng_state = torch.empty((2,), dtype=torch.int64, device=q.device)
 
-    return out, softmax_lse, p, rng_state
-
-
-if torch.__version__ >= "2.4.0":
-    _wrapped_flash_attn_forward = torch.ops.flash_attn._flash_attn_forward
-else:
-    _wrapped_flash_attn_forward = _flash_attn_forward
+    return softmax_lse, p, rng_state
 
 
 @_torch_custom_op_wrapper("flash_attn::_flash_attn_varlen_forward", mutates_args=(), device_types="cuda")
@@ -466,10 +459,13 @@ class FlashAttnQKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state =  _wrapped_flash_attn_forward(
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out_padded = torch.empty_like(q)
+        softmax_lse, S_dmask, rng_state =  _flash_attn_forward(
             q,
             k,
             v,
+            out_padded,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -645,10 +641,13 @@ class FlashAttnKVPackedFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out_padded = torch.empty_like(q)
+        softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
+            out_padded,
             dropout_p,
             softmax_scale,
             causal=causal,
@@ -836,10 +835,13 @@ class FlashAttnFunc(torch.autograd.Function):
             q = torch.nn.functional.pad(q, [0, 8 - head_size_og % 8])
             k = torch.nn.functional.pad(k, [0, 8 - head_size_og % 8])
             v = torch.nn.functional.pad(v, [0, 8 - head_size_og % 8])
-        out_padded, softmax_lse, S_dmask, rng_state = _wrapped_flash_attn_forward(
+        q, k, v = [maybe_contiguous(x) for x in (q, k, v)]
+        out_padded = torch.empty_like(q)
+        softmax_lse, S_dmask, rng_state = _flash_attn_forward(
             q,
             k,
             v,
+            out_padded,
             dropout_p,
             softmax_scale,
             causal=causal,
